@@ -22,41 +22,60 @@
  */
 
 #include <linux/fs.h>
+#include <sys/vfs.h>
 #include <sys/lzfs_exportfs.h>
+#include <sys/tsd_wrapper.h>
 
+extern int zfs_fid(vnode_t *vp, fid_t *fidp, caller_context_t *ct);
+extern int zfs_vget(vfs_t *vfsp, vnode_t **vpp, fid_t *fidp);
+extern int zfs_lookup(vnode_t *dvp, char *nm, vnode_t **vpp, struct pathname *pnp,
+    int flags, vnode_t *rdir, cred_t *cr,  caller_context_t *ct,
+    int *direntflags, pathname_t *realpnp);
 
 static int lzfs_encode_fh(struct dentry *dentry, u32 *fh, int *max_len, int connectable)
 {
         struct lzfs_fid  *lzfid = (struct lzfs_fid *)fh;
         struct inode *inode = dentry->d_inode;
-        int lfid_type;
+        int lfid_type = LZFS_FILEID_INO64_GEN;
+	vnode_t *vp;
+	int error = 0;
 
-        /* Directories don't need their parent encoded, they have ".." */
-        if (S_ISDIR(inode->i_mode) || !connectable)
-        {
-                lzfid->ino = inode->i_ino;
-                lzfid->gen = inode->i_generation;
-                lfid_type = LZFS_FILEID_INO64_GEN;
-        }
-        else
-        {
-                spin_lock(&dentry->d_lock);
-                lzfid->parent_ino = dentry->d_parent->d_inode->i_ino;
-                lzfid->parent_gen = dentry->d_parent->d_inode->i_generation;
-                spin_unlock(&dentry->d_lock);
-                lfid_type = LZFS_FILEID_INO64_GEN_PARENT;
-        }
+	ENTRY;
+	lzfid->fid_len = *max_len;
+	if (!(S_ISDIR(inode->i_mode) || !connectable))
+	{
+		spin_lock(&dentry->d_lock);
+		inode = dentry->d_parent->d_inode;
+		spin_unlock(&dentry->d_lock);
+		lfid_type = LZFS_FILEID_INO64_GEN_PARENT;
+	}
+
+	vp = LZFS_ITOV(inode);
+	error = zfs_fid( vp, lzfid, 0);
+        tsd_exit();
+        EXIT;
+
+	if (error)
+	{
+		printk(KERN_WARNING "Unable to get file handle \n");
+		return -ENOSPC;
+	}
+
+	*max_len = lzfid->fid_len;
+
         return lfid_type;
 }
-
 
 struct dentry * lzfs_fh_to_dentry(struct super_block *sb, struct fid *fid,
                                  int fh_len, int fh_type)
 {
         struct lzfs_fid  *lzfid = (struct lzfs_fid *)fid;
-        struct inode *inode = NULL;
-	u32 i_generation = 0;
+	vfs_t *vfsp = sb->s_fs_info;
+	vnode_t *vp;
+	int error = 0;
+	struct dentry *dentry = NULL;
 
+	ENTRY;
         if (fh_len < 2)
         {
                 return NULL;
@@ -65,44 +84,55 @@ struct dentry * lzfs_fh_to_dentry(struct super_block *sb, struct fid *fid,
         switch (fh_type)
         {
                 case LZFS_FILEID_INO64_GEN :
-                        inode = iget_locked(sb, lzfid->ino);
-                        if (!inode)
-                                return NULL;
-			i_generation = lzfid->gen;
-                        break;
                 case LZFS_FILEID_INO64_GEN_PARENT :
-                        inode = iget_locked(sb, lzfid->parent_ino);
-                        if (!inode)
-                                return NULL;
-			i_generation = lzfid->parent_gen;
-                        break;
+			error = zfs_vget( vfsp, &vp, lzfid);
+			break;
         }
 
-        if (inode->i_state & I_NEW)
-                unlock_new_inode(inode);
-
-	if (inode->i_generation != i_generation)
+	tsd_exit();
+	EXIT;
+	if (error)
+	{
+		printk(KERN_WARNING "Unable to get vnode \n");
 		return NULL;
+	}
 
-        return d_obtain_alias(inode);
+	if (LZFS_VTOI(vp))
+		dentry = d_obtain_alias(LZFS_VTOI(vp));
+        return dentry;
 }
 
 struct dentry *lzfs_get_parent(struct dentry *child)
 {
-        unsigned long p_ino;
-        struct inode *inode = NULL;
+	vnode_t *vcp = LZFS_ITOV(child->d_inode);
+	vnode_t *vp;
+	int error = 0;
+	struct dentry *dentry = NULL;
+	const struct cred *cred = get_current_cred();
 
-        printk(KERN_WARNING "In zfs_get_parent\n");
-        p_ino = parent_ino(child);
-        inode = iget_locked(child->d_inode->i_sb, p_ino);
+	ENTRY;
+	error = zfs_lookup(vcp, "..", &vp, NULL, 0 , NULL,
+                        (struct cred *) cred, NULL, NULL, NULL);
 
-        if(!inode)
-                return NULL;
+        put_cred(cred);
+        tsd_exit();
+        EXIT;
+        if (error) {
+                if (error == ENOENT)
+		{
+			printk(KERN_WARNING "Try to get new dentry \n");
+                        return d_splice_alias(NULL, dentry);
+		}
+                else   
+		{
+			printk(KERN_WARNING "Unable to get dentry \n");
+                        return ERR_PTR(-error);
+		}
+        }
 
-        if (inode->i_state & I_NEW)
-                unlock_new_inode(inode);
-
-        return d_obtain_alias(inode);
+        if (LZFS_VTOI(vp))
+                dentry = d_obtain_alias(LZFS_VTOI(vp));
+        return dentry;
 }
 
 const struct export_operations zfs_export_ops = {

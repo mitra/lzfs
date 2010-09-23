@@ -766,7 +766,7 @@ no_cached_page:
 		uio.uio_iovcnt  = 1;
 		uio.uio_loffset = (offset_t) *ppos;
 		uio.uio_resid   = size;
-		uio.uio_segflg  = UIO_SYSSPACE;
+		uio.uio_segflg  = UIO_USERSPACE;
 		err = zfs_read(vp, &uio, 0,(cred_t *) cred, NULL);
 		if (unlikely(err)) {
 			err = -err;
@@ -921,7 +921,7 @@ no_cached_page:
 		uio.uio_iovcnt  = 1;
 		uio.uio_loffset = (offset_t)(*ppos);
 		uio.uio_limit   = MAXOFFSET_T;
-		uio.uio_segflg  = UIO_SYSSPACE;
+		uio.uio_segflg  = UIO_USERSPACE;
 
 		err = zfs_write(vp, &uio, filep->f_flags, (cred_t *)cred, NULL);
 		if (unlikely(err)) {
