@@ -34,16 +34,15 @@ extern int zfs_lookup(vnode_t *dvp, char *nm, vnode_t **vpp, struct pathname *pn
 
 static int lzfs_encode_fh(struct dentry *dentry, u32 *fh, int *max_len, int connectable)
 {
-        struct lzfs_fid  *lzfid = (struct lzfs_fid *)fh;
-        struct inode *inode = dentry->d_inode;
-        int lfid_type = LZFS_FILEID_INO64_GEN;
+	struct lzfs_fid  *lzfid = (struct lzfs_fid *)fh;
+	struct inode *inode = dentry->d_inode;
+	int lfid_type = LZFS_FILEID_INO64_GEN;
 	vnode_t *vp;
 	int error = 0;
 
 	ENTRY;
 	lzfid->fid_len = *max_len;
-	if (!(S_ISDIR(inode->i_mode) || !connectable))
-	{
+	if (!(S_ISDIR(inode->i_mode) || !connectable)) {
 		spin_lock(&dentry->d_lock);
 		inode = dentry->d_parent->d_inode;
 		spin_unlock(&dentry->d_lock);
@@ -52,54 +51,50 @@ static int lzfs_encode_fh(struct dentry *dentry, u32 *fh, int *max_len, int conn
 
 	vp = LZFS_ITOV(inode);
 	error = zfs_fid( vp, lzfid, 0);
-        tsd_exit();
-        EXIT;
+	tsd_exit();
+	EXIT;
 
-	if (error)
-	{
+	if (error) {
 		printk(KERN_WARNING "Unable to get file handle \n");
-		return -ENOSPC;
+		return 255;
 	}
 
 	*max_len = lzfid->fid_len;
 
-        return lfid_type;
+	return lfid_type;
 }
 
 struct dentry * lzfs_fh_to_dentry(struct super_block *sb, struct fid *fid,
                                  int fh_len, int fh_type)
 {
-        struct lzfs_fid  *lzfid = (struct lzfs_fid *)fid;
+	struct lzfs_fid  *lzfid = (struct lzfs_fid *)fid;
 	vfs_t *vfsp = sb->s_fs_info;
 	vnode_t *vp;
 	int error = 0;
 	struct dentry *dentry = NULL;
 
 	ENTRY;
-        if (fh_len < 2)
-        {
-                return NULL;
-        }
+	if (fh_len < 2) {
+		return NULL;
+	}
 
-        switch (fh_type)
-        {
-                case LZFS_FILEID_INO64_GEN :
-                case LZFS_FILEID_INO64_GEN_PARENT :
+	switch (fh_type) {
+		case LZFS_FILEID_INO64_GEN :
+		case LZFS_FILEID_INO64_GEN_PARENT :
 			error = zfs_vget( vfsp, &vp, lzfid);
 			break;
-        }
+	}
 
 	tsd_exit();
 	EXIT;
-	if (error)
-	{
+	if (error) {
 		printk(KERN_WARNING "Unable to get vnode \n");
 		return NULL;
 	}
 
 	if (LZFS_VTOI(vp))
 		dentry = d_obtain_alias(LZFS_VTOI(vp));
-        return dentry;
+	return dentry;
 }
 
 struct dentry *lzfs_get_parent(struct dentry *child)
@@ -112,32 +107,29 @@ struct dentry *lzfs_get_parent(struct dentry *child)
 
 	ENTRY;
 	error = zfs_lookup(vcp, "..", &vp, NULL, 0 , NULL,
-                        (struct cred *) cred, NULL, NULL, NULL);
+			(struct cred *) cred, NULL, NULL, NULL);
 
-        put_cred(cred);
-        tsd_exit();
-        EXIT;
-        if (error) {
-                if (error == ENOENT)
-		{
+	put_cred(cred);
+	tsd_exit();
+	EXIT;
+	if (error) {
+		if (error == ENOENT) {
 			printk(KERN_WARNING "Try to get new dentry \n");
-                        return d_splice_alias(NULL, dentry);
-		}
-                else   
-		{
+			return d_splice_alias(NULL, dentry);
+		} else {
 			printk(KERN_WARNING "Unable to get dentry \n");
-                        return ERR_PTR(-error);
+			return ERR_PTR(-error);
 		}
-        }
+	}
 
-        if (LZFS_VTOI(vp))
-                dentry = d_obtain_alias(LZFS_VTOI(vp));
-        return dentry;
+	if (LZFS_VTOI(vp))
+		dentry = d_obtain_alias(LZFS_VTOI(vp));
+	return dentry;
 }
 
 const struct export_operations zfs_export_ops = {
-        .encode_fh      = lzfs_encode_fh,
-        .fh_to_dentry   = lzfs_fh_to_dentry,
-        .fh_to_parent   = lzfs_fh_to_dentry,
-        .get_parent     = lzfs_get_parent,
+	.encode_fh      = lzfs_encode_fh,
+	.fh_to_dentry   = lzfs_fh_to_dentry,
+	.fh_to_parent   = lzfs_fh_to_dentry,
+	.get_parent     = lzfs_get_parent,
 };

@@ -179,6 +179,8 @@ lzfs_vnop_lookup(struct inode * dir, struct dentry *dentry,
 	return d_splice_alias(LZFS_VTOI(vp), dentry);
 }
 
+#define ZFS_LINK_MAX	UINT32_MAX
+
 /* Add a hard link (new name) from dentry to inode pointed by old_dentry.
  */
 
@@ -194,6 +196,14 @@ lzfs_vnop_link (struct dentry *old_dentry, struct inode * dir,
 	int err;
 
 	ENTRY;
+	/* Linux Kernel enforces a limit on number of hardlinks to a file. 
+	 * struct kstat used in getattr uses unsigned int variable to store 
+	 * hardlink count. ZFS does not restrict the number of hardlinks, 
+	 * but we had to.
+	 * */
+	if (inode->i_nlink >= ZFS_LINK_MAX)
+		return -EMLINK;
+
 	err = checkname(name) || checkname((char *)old_dentry->d_name.name);
 	if(err)
 		return -ENAMETOOLONG;
@@ -808,15 +818,47 @@ out_error:
 	return err;
 }
 
+/* XXX --> Internal function used by lzfs_vnop_write and lzfs_writepage 
+ *
+ * Performs the write operation
+ *
+ * Explanation of parameters
+ * 		file_flags = struct file *file->f_flags
+ * 		buf        = buffer pointer to data
+ * 		len        = length of the data
+ * 		pos        = offest within file to wite
+ * 		segment    = indicates whether buf pointer points to 
+ * 		             user space buffer or kernel buffer.
+ * */
+ssize_t lzfs_write(vnode_t *vp, unsigned int file_flags, 
+		const char *buf, ssize_t len, loff_t pos, uio_seg_t segment)
+{
+	uio_t uio;
+	const cred_t *cred = get_current_cred();
+	struct iovec iov;
+	int err;
+
+	iov.iov_base = (void *) buf;
+	iov.iov_len  = len;
+
+	uio.uio_iov     = &iov;
+	uio.uio_resid   = len;
+	uio.uio_iovcnt  = 1;
+	uio.uio_loffset = (offset_t)(pos);
+	uio.uio_limit   = MAXOFFSET_T;
+	uio.uio_segflg  = segment;
+
+	err = zfs_write(vp, &uio, file_flags, (cred_t *)cred, NULL);
+	put_cred(cred);
+	return err;
+}
+
 ssize_t
 lzfs_vnop_write (struct file *filep, const char __user *buf, size_t len, 
 		 loff_t *ppos)
 {
-	struct iovec iov = { .iov_base = (void *) buf, .iov_len = len };
 	int err;
-	const cred_t *cred = get_current_cred();
 	vnode_t *vp = NULL;
-	uio_t uio;
 	ssize_t i_size;
 
 	/* PAGE CACHE SUPPORT VARIABLES */
@@ -835,6 +877,19 @@ lzfs_vnop_write (struct file *filep, const char __user *buf, size_t len,
 	ENTRY;
 
 	vp = LZFS_ITOV(inode);
+
+	if (!(vp->v_flag & VMMAPPED)) {
+		/* file is not memory mmapped, pass read directly to ZFS */
+		err = lzfs_write(vp, filep->f_flags, buf, len, *ppos, UIO_USERSPACE);
+		if (unlikely(err)) {
+			err = -err;
+			goto out_error;
+		}
+		*ppos += len;
+		written = len;
+		goto out_success;
+	}
+
 	i_size = i_size_read(inode);
 
 	pos_append = *ppos;
@@ -913,21 +968,12 @@ lzfs_vnop_write (struct file *filep, const char __user *buf, size_t len,
 		continue;
 
 no_cached_page:
-		iov.iov_base = (void *)user_buf;
-		iov.iov_len  = size;
-
-		uio.uio_iov     = &iov;
-		uio.uio_resid   = size;
-		uio.uio_iovcnt  = 1;
-		uio.uio_loffset = (offset_t)(*ppos);
-		uio.uio_limit   = MAXOFFSET_T;
-		uio.uio_segflg  = UIO_USERSPACE;
-
-		err = zfs_write(vp, &uio, filep->f_flags, (cred_t *)cred, NULL);
+		err = lzfs_write(vp, filep->f_flags, user_buf, size, *ppos, UIO_USERSPACE);
 		if (unlikely(err)) {
 			err = -err;
 			goto out_error;
 		}
+
 		*ppos += size;
 		pos_append += size;
 		user_buf += size;
@@ -936,12 +982,11 @@ no_cached_page:
 		offset   =  0;
 	}
 
-	put_cred(cred);
+out_success:
 	tsd_exit();
 	EXIT;
 	return ((ssize_t) written);
 out_error:
-	put_cred(cred);
 	tsd_exit();
 	EXIT;
 	return err;
@@ -976,10 +1021,16 @@ const struct inode_operations zfs_symlink_inode_operations = {
 
 int lzfs_file_mmap(struct file * file, struct vm_area_struct * vma)
 {
-//	struct address_space *mapping = file->f_mapping;
-//	vnode_t *vp = LZFS_ITOV(mapping->host);
+	struct address_space *mapping = file->f_mapping;
+	vnode_t *vp = LZFS_ITOV(mapping->host);
+	int rc;
 
-	return generic_file_mmap(file, vma);
+	rc = generic_file_mmap(file, vma);
+	if (rc < 0)
+		return rc;
+
+	vp->v_flag |= VMMAPPED;
+	return rc;
 }
 
 const struct inode_operations zfs_inode_operations = {
@@ -1107,7 +1158,6 @@ out:
 
 static int lzfs_writepage(struct page *page, struct writeback_control *wbc)
 {
-    const cred_t *cred  = get_current_cred();
     struct inode *inode = NULL;
     loff_t i_size       = 0;
     loff_t offset       = 1;
@@ -1116,11 +1166,6 @@ static int lzfs_writepage(struct page *page, struct writeback_control *wbc)
     char *buf           = NULL;
     vnode_t *vp         = NULL;
     struct file *filep  = NULL;
-    struct iovec iov;
-    uio_t uio;
-
-
-    //	int i;
 
 //    printk(KERN_ERR "%s: ==>\n", __FUNCTION__);
     inode  = page->mapping->host;
@@ -1153,25 +1198,12 @@ static int lzfs_writepage(struct page *page, struct writeback_control *wbc)
         len = i_size & ~PAGE_CACHE_MASK;
     }
 
-    bzero(&iov, sizeof(struct iovec));
-    bzero(&uio, sizeof(uio_t));
-
-    iov.iov_base    = buf;
-    iov.iov_len     = len;
-
-    uio.uio_iov     = &iov;
-    uio.uio_iovcnt  = 1;
-    uio.uio_loffset = (offset_t)(offset);
-    uio.uio_resid   = len;
-    uio.uio_segflg  = UIO_SYSSPACE;
-    uio.uio_limit   = MAXOFFSET_T;
-
     /*
      * zfs_write handles the FAPPEND flag by changing the file offset 
      * to the end of the file, but the we are in writepage and data 
      * should be written to same offset that we provide to zfs_write.
      * */
-    err = zfs_write(vp, &uio, filep->f_flags & ~FAPPEND, (cred_t *)cred, NULL);
+	err = lzfs_write(vp, filep->f_flags & ~FAPPEND, buf, len, offset, UIO_SYSSPACE);
     if (err) {
         SetPageError(page);
         err = -EIO;
@@ -1182,7 +1214,6 @@ out:
     //	page_clear_dirty(page);
     unlock_page(page);
 //    printk(KERN_ERR "%s: <==\n", __FUNCTION__);
-    put_cred(cred);
     return err;
 }
 
